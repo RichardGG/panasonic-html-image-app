@@ -32,3 +32,25 @@ jobs:
           name: lumix-probe-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumix-probe-debug-apk
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mv app-debug.apk lumix-probe-debug.apk
+          gh release create "build-${{ github.run_number }}" lumix-probe-debug.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Lumix Probe debug build ${{ github.run_number }}" \
+            --notes "Debug APK built from ${{ github.sha }}. Install on Android and allow installs from your browser."
