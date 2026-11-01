@@ -313,7 +313,7 @@ class MainActivity : Activity() {
     }
 
     /** Finds the Wi-Fi network, handshakes and starts the remote session. */
-    private fun connect(base: String): Boolean = synchronized(connectLock) {
+    private fun connect(base: String): Boolean = synchronized(connectLock) connectBlock@{
         connected = false
         log("=== Connecting to $base ===")
 
@@ -346,7 +346,7 @@ class MainActivity : Activity() {
         }
         if (!paired) {
             log("No handshake succeeded. Check Wi-Fi and the camera's Wi-Fi screen.")
-            return false
+            return@connectBlock false
         }
 
         try {
@@ -354,12 +354,12 @@ class MainActivity : Activity() {
             log("Start session (recmode): HTTP ${r.code} ${r.body.replace("\n", "").take(200)}")
         } catch (e: Exception) {
             log("  recmode failed: ${e.javaClass.simpleName}: ${e.message}")
-            return false
+            return@connectBlock false
         }
 
         connected = true
         log("=== Connected ===")
-        return true
+        true
     }
 
     // ---------------------------------------------------------------- commands
