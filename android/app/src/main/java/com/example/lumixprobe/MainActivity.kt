@@ -1,8 +1,10 @@
 package com.example.lumixprobe
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Typeface
@@ -11,7 +13,12 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
+import android.os.Environment
+import android.os.SystemClock
+import android.provider.MediaStore
 import android.text.InputType
+import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -26,24 +33,33 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
- * Minimal Lumix probe: joins the camera's (internet-less) Wi-Fi network, performs the
- * handshake, starts a remote session and dumps everything the camera reports about
- * itself (state, capability, menus) into an on-screen log that can be copied/shared.
+ * Lumix probe + basic remote: joins the camera's (internet-less) Wi-Fi network,
+ * handshakes, and offers zoom / shutter / video controls plus a full info dump
+ * that is saved to the Downloads folder.
  */
 class MainActivity : Activity() {
 
     private lateinit var ipField: EditText
-    private lateinit var probeButton: Button
     private lateinit var logView: TextView
     private lateinit var scroll: ScrollView
 
     private val logBuffer = StringBuilder()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    @Volatile private var network: Network? = null
+    @Volatile private var connected = false
+    private val connectLock = Any()
+
+    /** Camera commands are sent one at a time, in order (so "start" always precedes "stop"). */
+    private val cmdExecutor = Executors.newSingleThreadExecutor()
+    private val zoomToken = AtomicInteger()
 
     private data class Reply(val code: Int, val type: String, val body: String)
 
@@ -54,9 +70,8 @@ class MainActivity : Activity() {
         "4D454930-0100-1000-8000-F02765BACACE"
     )
 
-    // Queries run after a successful handshake: label to cam.cgi query string.
-    private val probes = listOf(
-        "Start session (recmode)" to "mode=camcmd&value=recmode",
+    // Queries saved by "Dump info".
+    private val dumpQueries = listOf(
         "State" to "mode=getstate",
         "Capability" to "mode=getinfo&type=capability",
         "All menu" to "mode=getinfo&type=allmenu",
@@ -67,10 +82,11 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        log("Lumix Probe ready. Join the camera's Wi-Fi, then tap 'Connect & probe'.")
+        log("Lumix Probe ready. Join the camera's Wi-Fi, then tap Connect.")
     }
 
     override fun onDestroy() {
+        cmdExecutor.shutdown()
         releaseNetworkRequest()
         super.onDestroy()
     }
@@ -79,6 +95,7 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -93,17 +110,35 @@ class MainActivity : Activity() {
         }
         root.addView(ipField, matchWrap())
 
-        probeButton = Button(this).apply {
-            text = "Connect & probe"
-            setOnClickListener { runProbe() }
-        }
-        root.addView(probeButton, matchWrap())
+        root.addView(row(
+            button("Connect") { runConnect() },
+            button("Dump info") { runDump() }
+        ), matchWrap())
 
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(smallButton("Copy") { copyLog() }, weighted())
-        row.addView(smallButton("Share") { shareLog() }, weighted())
-        row.addView(smallButton("Clear") { clearLog() }, weighted())
-        root.addView(row, matchWrap())
+        root.addView(label("Zoom - go to end (as fast as possible)"), matchWrap())
+        root.addView(row(
+            button("Min zoom (wide)") { autoZoom(tele = false) },
+            button("Max zoom (tele)") { autoZoom(tele = true) }
+        ), matchWrap())
+
+        root.addView(label("Zoom - hold to move, release to stop"), matchWrap())
+        root.addView(row(
+            holdButton("Wide (hold)", "wide-fast", "zoomstop"),
+            holdButton("Tele (hold)", "tele-fast", "zoomstop")
+        ), matchWrap())
+
+        root.addView(label("Shutter (hold = burst) / video"), matchWrap())
+        root.addView(row(
+            holdButton("Shoot", "capture", "capture_cancel"),
+            button("Rec start") { sendCmd("video_recstart") },
+            button("Rec stop") { sendCmd("video_recstop") }
+        ), matchWrap())
+
+        root.addView(row(
+            button("Copy") { copyLog() },
+            button("Share") { shareLog() },
+            button("Clear") { clearLog() }
+        ), matchWrap())
 
         logView = TextView(this).apply {
             typeface = Typeface.MONOSPACE
@@ -120,11 +155,48 @@ class MainActivity : Activity() {
     private fun matchWrap() = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
-    private fun weighted() = LinearLayout.LayoutParams(
-        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    private fun row(vararg views: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        for (v in views) {
+            addView(v, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+    }
 
-    private fun smallButton(label: String, action: () -> Unit) =
-        Button(this).apply { text = label; setOnClickListener { action() } }
+    private fun label(text: String) = TextView(this).apply {
+        this.text = text
+        textSize = 12f
+        setPadding(0, dp(8), 0, 0)
+    }
+
+    private fun button(text: String, action: () -> Unit) =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setOnClickListener { action() }
+        }
+
+    /** Sends [down] when pressed and [up] when released (or the touch is cancelled). */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun holdButton(text: String, down: String, up: String) =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setOnTouchListener { v, e ->
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.isPressed = true
+                        cancelAutoZoom()
+                        sendCmd(down)
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        v.isPressed = false
+                        sendCmd(up)
+                    }
+                }
+                true
+            }
+        }
 
     // ---------------------------------------------------------------- logging
 
@@ -165,6 +237,7 @@ class MainActivity : Activity() {
         try {
             getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(cb)
         } catch (e: Exception) {
+            // already unregistered
         }
         netCallback = null
     }
@@ -208,9 +281,9 @@ class MainActivity : Activity() {
         return found
     }
 
-    private fun httpGet(network: Network?, url: String): Reply {
+    private fun httpGet(net: Network?, url: String): Reply {
         val u = URL(url)
-        val conn = (if (network != null) network.openConnection(u) else u.openConnection())
+        val conn = (if (net != null) net.openConnection(u) else u.openConnection())
             as HttpURLConnection
         conn.connectTimeout = 5_000
         conn.readTimeout = 8_000
@@ -224,91 +297,192 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------------------------------------------------------------- probe
+    private fun baseUrl() = "http://${ipField.text.toString().trim()}/cam.cgi"
 
-    private fun runProbe() {
-        val ip = ipField.text.toString().trim()
-        if (ip.isEmpty()) {
-            Toast.makeText(this, "Enter the camera IP", Toast.LENGTH_SHORT).show()
-            return
-        }
-        probeButton.isEnabled = false
-        thread(name = "probe") {
+    // ---------------------------------------------------------------- connect
+
+    private fun runConnect() {
+        val base = baseUrl()
+        thread(name = "connect") {
             try {
-                probe(ip)
+                connect(base)
             } catch (e: Exception) {
                 log("ERROR: ${e.javaClass.simpleName}: ${e.message}")
-            } finally {
-                runOnUiThread { probeButton.isEnabled = true }
             }
         }
     }
 
-    private fun probe(ip: String) {
-        log("=== Probe started, camera $ip ===")
+    /** Finds the Wi-Fi network, handshakes and starts the remote session. */
+    private fun connect(base: String): Boolean = synchronized(connectLock) {
+        connected = false
+        log("=== Connecting to $base ===")
 
         log("Looking for Wi-Fi network...")
-        val network = findWifiNetwork()
-        if (network == null) {
+        val net = findWifiNetwork()
+        if (net == null) {
             log("No Wi-Fi network returned within 10s. Falling back to default routing " +
                 "(likely to fail if mobile data is on). Is the phone joined to the camera?")
         } else {
-            log("Using Wi-Fi network $network")
+            log("Using Wi-Fi network $net")
         }
+        network = net
 
-        val base = "http://$ip/cam.cgi"
-
-        // 1. Handshake
         var paired = false
         for ((i, uuid) in handshakes.withIndex()) {
             val name = URLEncoder.encode("LumixProbe", "UTF-8")
             val url = "$base?mode=accctrl&type=req_acc&value=$uuid&value2=$name"
-            log("Handshake ${i + 1}: GET $url")
+            log("Handshake ${i + 1}")
             val r = try {
-                httpGet(network, url)
+                httpGet(net, url)
             } catch (e: Exception) {
                 log("  failed: ${e.javaClass.simpleName}: ${e.message}")
                 continue
             }
-            log("  HTTP ${r.code} [${r.type}] ${r.body.trim().take(300)}")
+            log("  HTTP ${r.code} ${r.body.trim().take(300)}")
             if (r.body.trim().startsWith("ok")) {
                 paired = true
                 break
             }
         }
         if (!paired) {
-            log("No handshake succeeded; stopping. Check Wi-Fi and the camera's Wi-Fi screen.")
-            return
+            log("No handshake succeeded. Check Wi-Fi and the camera's Wi-Fi screen.")
+            return false
         }
-        log("Handshake OK.")
 
-        // 2. Session start + information dump
-        for ((label, query) in probes) {
-            val url = "$base?$query"
-            log("--- $label: GET $url")
-            val r = try {
-                httpGet(network, url)
-            } catch (e: Exception) {
-                log("  failed: ${e.javaClass.simpleName}: ${e.message}")
-                continue
-            }
-            log("  HTTP ${r.code} [${r.type}] ${r.body.length} chars")
-            val body = r.body.trim()
-            log(body.take(20_000) + if (body.length > 20_000) "\n...[truncated]" else "")
-            if (body.startsWith("<")) summarize(label, body)
+        try {
+            val r = httpGet(net, "$base?mode=camcmd&value=recmode")
+            log("Start session (recmode): HTTP ${r.code} ${r.body.replace("\n", "").take(200)}")
+        } catch (e: Exception) {
+            log("  recmode failed: ${e.javaClass.simpleName}: ${e.message}")
+            return false
         }
-        log("=== Probe finished ===")
+
+        connected = true
+        log("=== Connected ===")
+        return true
     }
 
-    /** Best-effort overview of an XML reply: distinct element names and id="..." values. */
-    private fun summarize(label: String, xml: String) {
-        val tags = Regex("<([A-Za-z_][\\w.-]*)").findAll(xml).map { it.groupValues[1] }
-            .distinct().toList()
-        val ids = Regex("\\bid=\"([^\"]+)\"").findAll(xml).map { it.groupValues[1] }
-            .distinct().toList()
-        log("  [summary of $label] elements (${tags.size}): ${tags.take(40).joinToString(", ")}")
-        if (ids.isNotEmpty()) {
-            log("  [summary of $label] ids (${ids.size}): ${ids.take(120).joinToString(", ")}")
+    // ---------------------------------------------------------------- commands
+
+    private fun notConnected() = log("Not connected - tap Connect first.")
+
+    /** Fire-and-forget camcmd, executed in order on a background thread. */
+    private fun sendCmd(value: String) {
+        if (!connected) {
+            notConnected()
+            return
         }
+        val base = baseUrl()
+        val net = network
+        cmdExecutor.execute {
+            try {
+                val r = httpGet(net, "$base?mode=camcmd&value=$value")
+                log("$value -> HTTP ${r.code} ${r.body.replace("\n", "").trim().take(150)}")
+            } catch (e: Exception) {
+                log("$value failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+
+    private fun cancelAutoZoom() {
+        zoomToken.incrementAndGet()
+    }
+
+    /**
+     * Zoom all the way to one end at the fastest speed. The camera stops by itself at the
+     * end of its range; we also poll the lens info and send zoomstop once it stops changing
+     * (or after a safety timeout). Raw lens samples are logged so we can learn which
+     * field tracks the zoom position.
+     */
+    private fun autoZoom(tele: Boolean) {
+        if (!connected) {
+            notConnected()
+            return
+        }
+        val base = baseUrl()
+        val net = network
+        val token = zoomToken.incrementAndGet()
+        val cmd = if (tele) "tele-fast" else "wide-fast"
+
+        thread(name = "autozoom") {
+            try {
+                val t0 = SystemClock.elapsedRealtime()
+                log("Auto zoom: $cmd")
+                val start = httpGet(net, "$base?mode=camcmd&value=$cmd")
+                log("  $cmd -> ${start.body.replace("\n", "").trim().take(100)}")
+
+                var last = ""
+                var same = 0
+                while (token == zoomToken.get() &&
+                    SystemClock.elapsedRealtime() - t0 < 10_000) {
+                    Thread.sleep(250)
+                    val lens = httpGet(net, "$base?mode=getinfo&type=lens").body.trim()
+                    if (lens != last) {
+                        log("  lens: $lens")
+                        last = lens
+                        same = 0
+                    } else {
+                        same++
+                    }
+                    if (same >= 16) break // unchanged for ~4s
+                }
+
+                if (token == zoomToken.get()) {
+                    val stop = httpGet(net, "$base?mode=camcmd&value=zoomstop")
+                    log("  zoomstop -> ${stop.body.replace("\n", "").trim().take(100)} " +
+                        "(${SystemClock.elapsedRealtime() - t0} ms)")
+                } else {
+                    log("  auto zoom superseded")
+                }
+            } catch (e: Exception) {
+                log("Auto zoom failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- dump
+
+    private fun runDump() {
+        val base = baseUrl()
+        thread(name = "dump") {
+            try {
+                if (!connected && !connect(base)) return@thread
+                val net = network
+                val out = StringBuilder()
+                out.append("Lumix dump ${Date()}\ncamera $base\n\n")
+                for ((label, query) in dumpQueries) {
+                    val url = "$base?$query"
+                    log("Dump: $label")
+                    out.append("===== $label =====\nGET $url\n")
+                    try {
+                        val r = httpGet(net, url)
+                        out.append("HTTP ${r.code} [${r.type}] ${r.body.length} chars\n")
+                        out.append(r.body.trim()).append("\n\n")
+                        log("  HTTP ${r.code}, ${r.body.length} chars")
+                    } catch (e: Exception) {
+                        out.append("FAILED: ${e.javaClass.simpleName}: ${e.message}\n\n")
+                        log("  failed: ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                }
+                val name = saveDump(out.toString())
+                log("Saved full dump to Downloads/$name (${out.length} chars)")
+            } catch (e: Exception) {
+                log("Dump ERROR: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+
+    private fun saveDump(text: String): String {
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val name = "lumix-dump-$stamp.txt"
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
+        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Could not create file in Downloads")
+        contentResolver.openOutputStream(uri)!!.use { it.write(text.toByteArray()) }
+        return name
     }
 }
